@@ -1,0 +1,9 @@
+version:  2
+
+sources:
+  - name: ameritas_raw
+    database: AMERITAS
+    schema: RAW
+    tables:
+      - name: CLAIMS
+        description: "raw claims data loaded from GCS using Matillion"
