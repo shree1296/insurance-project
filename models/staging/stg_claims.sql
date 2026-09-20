@@ -5,41 +5,28 @@
     )
 }}
 
-
 -- ============================================================
 -- MODEL: STG_CLAIMS
--- ============================================================
---
 -- PURPOSE:
---   Standardize, cleanse, hash, and deduplicate claim records
---   coming from the RAW layer.
---
--- SOURCE:
---   AMERITAS.RAW.CLAIMS
---
--- TARGET:
---   AMERITAS.STAGING.STG_CLAIMS
+--   Transform RAW.CLAIMS into a clean, standardized staging
+--   table before the data is consumed by MART dimensions/facts.
 --
 -- GRAIN:
---   One row per CLAIM_ID
+--   One row per CLAIM_ID.
 --
--- RESPONSIBILITIES:
---   1. Standardize identifiers and text
---   2. Preserve source datatypes
---   3. Standardize financial precision
---   4. Generate a deterministic RECORD_HASH
---   5. Deduplicate multiple versions of the same claim
+-- KEY TRANSFORMATIONS:
+--   1. Standardize text values using TRIM / UPPER
+--   2. Convert blank strings to NULL
+--   3. Preserve existing Snowflake DATE / NUMBER / TIMESTAMP types
+--   4. Generate a deterministic record hash
+--   5. Deduplicate CLAIM_ID using the latest available record
+--   6. Preserve ingestion / source metadata for lineage
 --
 -- IMPORTANT:
---   RAW.CLAIMS already contains strongly typed Snowflake columns.
---   Therefore we do NOT use TRY_TO_DATE(), TRY_TO_DECIMAL(),
---   or TRY_TO_TIMESTAMP_NTZ() on values that are already
---   DATE, NUMBER, or TIMESTAMP_NTZ.
---
---   TRY_* functions are appropriate when the incoming value is
---   stored as an uncertain/string datatype and conversion itself
---   is part of the transformation.
---
+--   RAW columns are already typed as DATE, NUMBER and TIMESTAMP_NTZ.
+--   Therefore we use explicit casts (::TYPE) instead of TRY_TO_*
+--   functions. TRY_TO_* functions are primarily useful when the
+--   incoming value is a string or otherwise potentially malformed.
 -- ============================================================
 
 
@@ -47,20 +34,11 @@ WITH source_data AS (
 
     SELECT
 
-        /* =====================================================
-           CLAIM IDENTIFIERS
-           ===================================================== */
-
-        -- Source:
-        --     NUMBER(38,0)
-        --
-        -- Staging:
-        --     NUMBER(38,0)
+        -- ========================================================
+        -- BUSINESS / PRIMARY KEY
+        -- ========================================================
 
         CLAIM_ID::NUMBER(38,0) AS CLAIM_ID,
-
-        -- Remove leading/trailing whitespace.
-        -- Convert empty strings to NULL.
 
         NULLIF(
             TRIM(CLAIM_NUMBER),
@@ -68,9 +46,9 @@ WITH source_data AS (
         ) AS CLAIM_NUMBER,
 
 
-        /* =====================================================
-           FOREIGN KEYS
-           ===================================================== */
+        -- ========================================================
+        -- FOREIGN KEYS
+        -- ========================================================
 
         POLICY_ID::NUMBER(38,0) AS POLICY_ID,
 
@@ -79,11 +57,13 @@ WITH source_data AS (
         PROVIDER_ID::NUMBER(38,0) AS PROVIDER_ID,
 
 
-        /* =====================================================
-           CLAIM ATTRIBUTES
-           ===================================================== */
-
-        -- Standardize categorical text to uppercase.
+        -- ========================================================
+        -- CLAIM CLASSIFICATION
+        -- Standardize text values.
+        -- Example:
+        --   ' medical ' -> 'MEDICAL'
+        --   ''          -> NULL
+        -- ========================================================
 
         NULLIF(
             UPPER(TRIM(CLAIM_TYPE)),
@@ -96,33 +76,24 @@ WITH source_data AS (
         ) AS CLAIM_STATUS,
 
 
-        /* =====================================================
-           CLAIM DATES
-           ===================================================== */
-
-        -- RAW.CLAIMS already stores these columns as DATE.
+        -- ========================================================
+        -- DATES
         --
-        -- Therefore a TRY_TO_DATE() conversion is unnecessary.
-        --
-        -- We explicitly preserve the DATE datatype.
+        -- RAW columns are already DATE columns.
+        -- Use direct casting rather than TRY_TO_DATE().
+        -- ========================================================
 
         SERVICE_DATE::DATE AS SERVICE_DATE,
 
         RECEIVED_DATE::DATE AS RECEIVED_DATE,
 
 
-        /* =====================================================
-           FINANCIAL AMOUNTS
-           ===================================================== */
-
-        -- Source:
-        --     NUMBER(18,2)
+        -- ========================================================
+        -- FINANCIAL AMOUNTS
         --
-        -- Staging:
-        --     NUMBER(18,2)
-        --
-        -- Financial amounts should remain exact DECIMAL/NUMBER
-        -- values. FLOAT should NOT be used for these fields.
+        -- Preserve exact decimal semantics.
+        -- Do NOT use FLOAT for monetary values.
+        -- ========================================================
 
         REPORTED_AMOUNT::NUMBER(18,2) AS REPORTED_AMOUNT,
 
@@ -136,26 +107,19 @@ WITH source_data AS (
             AS MEMBER_RESPONSIBILITY_AMOUNT,
 
 
-        /* =====================================================
-           CLAIM CLASSIFICATION
-           ===================================================== */
-
-        -- Normalize diagnosis codes to uppercase.
+        -- ========================================================
+        -- CLAIM DETAILS
+        -- ========================================================
 
         NULLIF(
             UPPER(TRIM(DIAGNOSIS_CODE)),
             ''
         ) AS DIAGNOSIS_CODE,
 
-        -- Normalize place-of-service values.
-
         NULLIF(
             UPPER(TRIM(PLACE_OF_SERVICE)),
             ''
         ) AS PLACE_OF_SERVICE,
-
-        -- Preserve natural casing of free-text descriptions.
-        -- Only trim surrounding whitespace.
 
         NULLIF(
             TRIM(CLAIM_DESCRIPTION),
@@ -163,19 +127,17 @@ WITH source_data AS (
         ) AS CLAIM_DESCRIPTION,
 
 
-        /* =====================================================
-           SOURCE TIMESTAMPS
-           ===================================================== */
-
-        -- RAW.CLAIMS already contains TIMESTAMP_NTZ values.
+        -- ========================================================
+        -- SOURCE TIMESTAMPS
         --
-        -- Do NOT use:
+        -- RAW columns are already TIMESTAMP_NTZ.
         --
-        --     TRY_TO_TIMESTAMP_NTZ(CREATED_TIMESTAMP)
+        -- DO NOT use:
+        --   TRY_TO_TIMESTAMP_NTZ(CREATED_TIMESTAMP)
         --
-        -- because the source is already TIMESTAMP_NTZ.
-        --
-        -- Explicit casts document the intended target datatype.
+        -- because Snowflake does not allow TRY_CAST from
+        -- TIMESTAMP_NTZ to TIMESTAMP_NTZ in this context.
+        -- ========================================================
 
         CREATED_TIMESTAMP::TIMESTAMP_NTZ
             AS CREATED_TIMESTAMP,
@@ -184,12 +146,9 @@ WITH source_data AS (
             AS UPDATED_TIMESTAMP,
 
 
-        /* =====================================================
-           INGESTION METADATA
-           ===================================================== */
-
-        -- Metadata fields are strings in RAW.
-        -- Standardize empty strings to NULL.
+        -- ========================================================
+        -- INGESTION / LINEAGE METADATA
+        -- ========================================================
 
         NULLIF(
             TRIM(BATCH_ID),
@@ -211,85 +170,78 @@ WITH source_data AS (
             ''
         ) AS SOURCE_FILE_PATH,
 
-        -- INGESTED_TS is already TIMESTAMP_NTZ in RAW.
-
-        INGESTED_TS::TIMESTAMP_NTZ AS INGESTED_TS
-
+        INGESTED_TS::TIMESTAMP_NTZ
+            AS INGESTED_TS
 
     FROM {{ source('ameritas_raw', 'CLAIMS') }}
 
 ),
 
 
-/* ============================================================
-   RECORD HASH
-   ============================================================
-
-   PURPOSE:
-       Generate a deterministic hash representing the
-       standardized business content of the claim.
-
-   IMPORTANT:
-       Hashing occurs AFTER standardization.
-
-   Example:
-
-       ' CLM10001 '
-             |
-             v
-       'CLM10001'
-
-   Therefore insignificant source formatting differences do
-   not create different hashes.
-
-   RECORD_HASH can later support:
-
-       - Change detection
-       - Incremental processing
-       - Auditing
-       - Comparing source and target records
-
-   RECORD_HASH is NOT the business key.
-
-   Business key:
-       CLAIM_ID
-
-   ============================================================ */
+-- ============================================================
+-- RECORD HASH
+--
+-- Purpose:
+--   Creates a deterministic fingerprint of the important
+--   business attributes of the claim.
+--
+-- Useful for:
+--   - Change detection
+--   - Incremental processing
+--   - Data reconciliation
+--   - Audit / lineage
+-- ============================================================
 
 hashed_data AS (
 
     SELECT
 
         CLAIM_ID,
+
         CLAIM_NUMBER,
 
         POLICY_ID,
+
         MEMBER_ID,
+
         PROVIDER_ID,
 
         CLAIM_TYPE,
+
         CLAIM_STATUS,
 
         SERVICE_DATE,
+
         RECEIVED_DATE,
 
         REPORTED_AMOUNT,
+
         ALLOWED_AMOUNT,
+
         APPROVED_AMOUNT,
+
         PAID_AMOUNT,
+
         MEMBER_RESPONSIBILITY_AMOUNT,
 
         DIAGNOSIS_CODE,
+
         PLACE_OF_SERVICE,
+
         CLAIM_DESCRIPTION,
 
         CREATED_TIMESTAMP,
+
         UPDATED_TIMESTAMP,
 
         BATCH_ID,
+
         SOURCE_SYSTEM,
+
         SOURCE_FILE_NAME,
+
         SOURCE_FILE_PATH,
+
         INGESTED_TS,
 
 
@@ -297,123 +249,184 @@ hashed_data AS (
             CONCAT_WS(
                 '|',
 
-                COALESCE(CLAIM_ID::VARCHAR, ''),
-                COALESCE(CLAIM_NUMBER, ''),
+                COALESCE(
+                    CLAIM_ID::VARCHAR,
+                    ''
+                ),
 
-                COALESCE(POLICY_ID::VARCHAR, ''),
-                COALESCE(MEMBER_ID::VARCHAR, ''),
-                COALESCE(PROVIDER_ID::VARCHAR, ''),
+                COALESCE(
+                    CLAIM_NUMBER,
+                    ''
+                ),
 
-                COALESCE(CLAIM_TYPE, ''),
-                COALESCE(CLAIM_STATUS, ''),
+                COALESCE(
+                    POLICY_ID::VARCHAR,
+                    ''
+                ),
 
-                COALESCE(SERVICE_DATE::VARCHAR, ''),
-                COALESCE(RECEIVED_DATE::VARCHAR, ''),
+                COALESCE(
+                    MEMBER_ID::VARCHAR,
+                    ''
+                ),
 
-                COALESCE(REPORTED_AMOUNT::VARCHAR, ''),
-                COALESCE(ALLOWED_AMOUNT::VARCHAR, ''),
-                COALESCE(APPROVED_AMOUNT::VARCHAR, ''),
-                COALESCE(PAID_AMOUNT::VARCHAR, ''),
-                COALESCE(MEMBER_RESPONSIBILITY_AMOUNT::VARCHAR, ''),
+                COALESCE(
+                    PROVIDER_ID::VARCHAR,
+                    ''
+                ),
 
-                COALESCE(DIAGNOSIS_CODE, ''),
-                COALESCE(PLACE_OF_SERVICE, ''),
-                COALESCE(CLAIM_DESCRIPTION, ''),
+                COALESCE(
+                    CLAIM_TYPE,
+                    ''
+                ),
 
-                COALESCE(CREATED_TIMESTAMP::VARCHAR, ''),
-                COALESCE(UPDATED_TIMESTAMP::VARCHAR, '')
+                COALESCE(
+                    CLAIM_STATUS,
+                    ''
+                ),
 
+                COALESCE(
+                    SERVICE_DATE::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    RECEIVED_DATE::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    REPORTED_AMOUNT::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    ALLOWED_AMOUNT::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    APPROVED_AMOUNT::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    PAID_AMOUNT::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    MEMBER_RESPONSIBILITY_AMOUNT::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    DIAGNOSIS_CODE,
+                    ''
+                ),
+
+                COALESCE(
+                    PLACE_OF_SERVICE,
+                    ''
+                ),
+
+                COALESCE(
+                    CLAIM_DESCRIPTION,
+                    ''
+                ),
+
+                COALESCE(
+                    CREATED_TIMESTAMP::VARCHAR,
+                    ''
+                ),
+
+                COALESCE(
+                    UPDATED_TIMESTAMP::VARCHAR,
+                    ''
+                )
             ),
             256
         ) AS RECORD_HASH
-
 
     FROM source_data
 
 ),
 
 
-/* ============================================================
-   DEDUPLICATION
-   ============================================================
-
-   GRAIN:
-       One row per CLAIM_ID
-
-   WHY DEDUPLICATION IS REQUIRED:
-       The RAW layer may contain multiple versions of the same
-       claim because of:
-
-           - Source updates
-           - Reprocessing
-           - Re-ingestion
-           - Multiple ingestion batches
-
-   BUSINESS KEY:
-       CLAIM_ID
-
-   RECORD SELECTION PRIORITY:
-
-       1. Most recent UPDATED_TIMESTAMP
-       2. Most recent INGESTED_TS
-       3. Highest/latest BATCH_ID
-       4. SOURCE_FILE_NAME as final tie-breaker
-
-   NULLS LAST:
-       Missing timestamps should not incorrectly win over
-       records that contain valid timestamps.
-
-   IMPORTANT:
-       This deduplication is appropriate for CLAIMS because
-       CLAIM_ID represents the claim-level business entity.
-
-       We should NOT blindly apply the same logic to event or
-       transaction tables such as:
-
-           CLAIM_PAYMENTS
-           CLAIM_STATUS_HISTORY
-           CLAIM_DOCUMENTS
-           CLAIM_NOTES
-
-       because multiple legitimate records can exist for
-       the same CLAIM_ID in those tables.
-
-   ============================================================ */
+-- ============================================================
+-- DEDUPLICATION
+--
+-- BUSINESS RULE:
+--   Keep exactly one record per CLAIM_ID.
+--
+-- WINNER:
+--   1. Latest UPDATED_TIMESTAMP
+--   2. Latest INGESTED_TS
+--   3. Latest BATCH_ID
+--   4. Latest SOURCE_FILE_NAME
+--
+-- NULLS LAST:
+--   A record with a NULL UPDATED_TIMESTAMP should not win over
+--   a record with a valid timestamp.
+--
+-- IMPORTANT:
+--   This logic is appropriate for CLAIMS because CLAIM_ID
+--   represents the business grain of this staging model.
+--
+--   Do NOT blindly apply this logic to event/transaction tables
+--   such as CLAIM_PAYMENTS or CLAIM_STATUS_HISTORY, where multiple
+--   rows per CLAIM_ID are legitimate.
+-- ============================================================
 
 ranked_claims AS (
 
     SELECT
 
         CLAIM_ID,
+
         CLAIM_NUMBER,
 
         POLICY_ID,
+
         MEMBER_ID,
+
         PROVIDER_ID,
 
         CLAIM_TYPE,
+
         CLAIM_STATUS,
 
         SERVICE_DATE,
+
         RECEIVED_DATE,
 
         REPORTED_AMOUNT,
+
         ALLOWED_AMOUNT,
+
         APPROVED_AMOUNT,
+
         PAID_AMOUNT,
+
         MEMBER_RESPONSIBILITY_AMOUNT,
 
         DIAGNOSIS_CODE,
+
         PLACE_OF_SERVICE,
+
         CLAIM_DESCRIPTION,
 
         CREATED_TIMESTAMP,
+
         UPDATED_TIMESTAMP,
 
         BATCH_ID,
+
         SOURCE_SYSTEM,
+
         SOURCE_FILE_NAME,
+
         SOURCE_FILE_PATH,
+
         INGESTED_TS,
 
         RECORD_HASH,
@@ -435,60 +448,68 @@ ranked_claims AS (
 
         ) AS RN
 
-
     FROM hashed_data
 
 )
 
 
-/* ============================================================
-   FINAL STAGING OUTPUT
-   ============================================================
-
-   Only the latest record for each CLAIM_ID is retained.
-
-   FINAL GRAIN:
-
-       ONE ROW PER CLAIM_ID
-
-   ============================================================ */
+-- ============================================================
+-- FINAL STAGING DATASET
+--
+-- One row per CLAIM_ID.
+-- ============================================================
 
 SELECT
 
     CLAIM_ID,
+
     CLAIM_NUMBER,
 
     POLICY_ID,
+
     MEMBER_ID,
+
     PROVIDER_ID,
 
     CLAIM_TYPE,
+
     CLAIM_STATUS,
 
     SERVICE_DATE,
+
     RECEIVED_DATE,
 
     REPORTED_AMOUNT,
+
     ALLOWED_AMOUNT,
+
     APPROVED_AMOUNT,
+
     PAID_AMOUNT,
+
     MEMBER_RESPONSIBILITY_AMOUNT,
 
     DIAGNOSIS_CODE,
+
     PLACE_OF_SERVICE,
+
     CLAIM_DESCRIPTION,
 
     CREATED_TIMESTAMP,
+
     UPDATED_TIMESTAMP,
 
     BATCH_ID,
+
     SOURCE_SYSTEM,
+
     SOURCE_FILE_NAME,
+
     SOURCE_FILE_PATH,
+
     INGESTED_TS,
 
     RECORD_HASH
-
 
 FROM ranked_claims
 
