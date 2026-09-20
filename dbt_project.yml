@@ -37,3 +37,6 @@ clean-targets:         # directories to be removed by `dbt clean`
 
 models:
     # Applies to all files under models/example/
+    ameritas:
+      staging:
+        +schema: STAGING
